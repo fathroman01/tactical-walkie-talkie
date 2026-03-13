@@ -47,8 +47,17 @@
                 
                 <div class="channel-display">
                     <h2 class="channel-label">CH</h2>
-                    <h1 class="channel-number" id="current-ch-display">01</h1>
+                    <div class="channel-selector">
+                        <button class="ch-btn" id="btn-ch-down"><ion-icon name="caret-back-outline"></ion-icon></button>
+                        <h1 class="channel-number" id="current-ch-display">01</h1>
+                        <button class="ch-btn" id="btn-ch-up"><ion-icon name="caret-forward-outline"></ion-icon></button>
+                    </div>
                     <p class="channel-name" id="current-ch-name">Bravo Six</p>
+                    
+                    <div id="active-users-count" class="active-users-count">
+                        <ion-icon name="people-outline"></ion-icon>
+                        <span id="active-count-text">1 Online</span>
+                    </div>
                 </div>
 
                 <div class="ptt-container">
@@ -97,8 +106,23 @@
                     <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 20px; line-height: 1.5;">Your device is configured to automatically link with any other device on the exact same Channel frequency (01-99).</p>
                     
                     <div class="input-group">
+                        <label>OPERATOR AVATAR</label>
+                        <div class="avatar-selector" id="avatar-selector">
+                            <div class="avatar-option active" data-avatar="👨‍🚀">👨‍🚀</div>
+                            <div class="avatar-option" data-avatar="🥷">🥷</div>
+                            <div class="avatar-option" data-avatar="🕵️‍♂️">🕵️‍♂️</div>
+                            <div class="avatar-option" data-avatar="🤖">🤖</div>
+                            <div class="avatar-option" data-avatar="👽">👽</div>
+                            <div class="avatar-option" data-avatar="💀">💀</div>
+                        </div>
+                    </div>
+                    
+                    <div class="input-group">
                         <label>YOUR CALLSIGN</label>
-                        <input type="text" id="my-callsign-input" placeholder="e.g. Eagle One" value="Operator">
+                        <div style="display: flex; gap: 10px; width: 100%;">
+                            <input type="text" id="my-callsign-input" placeholder="e.g. Eagle One" value="Operator" style="flex: 1; margin-bottom: 0;">
+                            <button class="btn btn-primary" id="btn-save-callsign" style="padding: 0 16px; margin-top: 0;">SAVE</button>
+                        </div>
                     </div>
                     
                     <div class="input-group">
@@ -126,6 +150,49 @@
         </nav>
 
         <!-- Overlay / Modals -->
+        <div id="pin-modal-overlay" class="overlay">
+            <div class="modal">
+                <h3>RESTRICTED CHANNEL</h3>
+                <p style="font-size: 12px; color: var(--text-muted); text-align: center; margin-bottom: 20px;">Enter clearance code for CH 10</p>
+                <div class="input-group">
+                    <label>ACCESS PIN</label>
+                    <input type="password" id="ch-pin-input" placeholder="****" maxlength="4" style="text-align: center; letter-spacing: 10px; font-size: 24px;">
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="btn-cancel-pin">CANCEL</button>
+                    <button class="btn btn-primary" id="btn-submit-pin">VERIFY</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="users-modal-overlay" class="overlay">
+            <div class="modal">
+                <h3>CHANNEL <span id="users-modal-ch" style="color: var(--neon-green)">01</span> USERS</h3>
+                <div class="users-list" id="active-users-list">
+                    <!-- Populated by JS -->
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="btn-close-users-modal">CLOSE</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="channel-action-modal-overlay" class="overlay">
+            <div class="modal">
+                <h3>CHANNEL <span id="action-modal-ch" style="color: var(--neon-green)">01</span></h3>
+                <p style="font-size: 14px; color: var(--text-main); text-align: center; margin-bottom: 24px;" id="action-modal-name">Alpha Squad</p>
+                <div class="modal-actions" style="flex-direction: column; gap: 12px; margin-top: 0;">
+                    <button class="btn btn-secondary" id="btn-action-info" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                        <ion-icon name="information-circle-outline"></ion-icon> INFO
+                    </button>
+                    <button class="btn btn-primary" id="btn-action-join" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                        <ion-icon name="log-in-outline"></ion-icon> JOIN
+                    </button>
+                    <button class="btn btn-secondary" id="btn-cancel-action" style="width: 100%; border: none; font-size: 12px; margin-top: 8px;">CANCEL</button>
+                </div>
+            </div>
+        </div>
+
         <div id="modal-overlay" class="overlay">
             <div class="modal">
                 <h3>CREATE CHANNEL</h3>

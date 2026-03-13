@@ -1,15 +1,20 @@
 // Walkie-Talkie App Logic
 
 // Data State
-let channels = [
-    { num: '01', name: 'Alpha Squad', freq: '462.5625 MHz' },
-    { num: '02', name: 'Bravo Six', freq: '462.5875 MHz' },
-    { num: '09', name: 'Emergency', freq: '462.7125 MHz' },
-];
+let channels = [];
+for (let i = 1; i <= 20; i++) {
+    channels.push({
+        num: String(i).padStart(2, '0'),
+        name: `Channel ${String(i).padStart(2, '0')}`,
+        freq: `462.${2500 + i * 25} MHz`
+    });
+}
 let activeChannelNum = '02';
 let isTransmitting = false;
 let isSignaling = false; // Prevents overlapping rapid button presses
-let eqInterval;
+let eqAnimFrame;
+let currentAnalyser = null;
+let localAudioSource = null;
 
 // WebRTC / PeerJS State
 let peer;
@@ -20,7 +25,10 @@ let localPeerId = '';
 let localNodeIndex = -1;
 const MAX_NODES = 5;
 let activeCalls = [];
-let activeConnections = []; // Data connections for signaling
+let activeConnections = []; // Data connections for signaling (PTT)
+let activeUsers = {};
+let presenceInterval;
+let presenceConnections = {};
 
 // DOM Elements
 const screenRadio = document.getElementById('screen-radio');
@@ -48,6 +56,33 @@ const myPeerIdInput = document.getElementById('my-peer-id');
 const callerIdDisplay = document.getElementById('caller-id-display');
 const topLeftStatus = document.getElementById('top-left-status');
 const myCallsignInput = document.getElementById('my-callsign-input');
+const btnSaveCallsign = document.getElementById('btn-save-callsign');
+const avatarOptions = document.querySelectorAll('.avatar-option');
+let currentAvatar = '👨‍🚀';
+
+const btnChUp = document.getElementById('btn-ch-up');
+const btnChDown = document.getElementById('btn-ch-down');
+
+const modalPinOverlay = document.getElementById('pin-modal-overlay');
+const btnCancelPin = document.getElementById('btn-cancel-pin');
+const btnSubmitPin = document.getElementById('btn-submit-pin');
+const inputPin = document.getElementById('ch-pin-input');
+let pendingChannelSelect = null;
+
+const modalChannelActionOverlay = document.getElementById('channel-action-modal-overlay');
+const actionModalCh = document.getElementById('action-modal-ch');
+const actionModalName = document.getElementById('action-modal-name');
+const btnActionInfo = document.getElementById('btn-action-info');
+const btnActionJoin = document.getElementById('btn-action-join');
+const btnCancelAction = document.getElementById('btn-cancel-action');
+let selectedChannelForAction = null;
+
+const btnActiveUsers = document.getElementById('active-users-count');
+const countText = document.getElementById('active-count-text');
+const modalUsersOverlay = document.getElementById('users-modal-overlay');
+const btnCloseUsersModal = document.getElementById('btn-close-users-modal');
+const activeUsersList = document.getElementById('active-users-list');
+const usersModalCh = document.getElementById('users-modal-ch');
 
 // --- Audio Synthesis for Walkie-Talkie Sounds ---
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -153,6 +188,25 @@ function playPTTRelease() {
 
 // Init
 function init() {
+    // Load saved callsign if any
+    const savedCallsign = localStorage.getItem('tactical_callsign');
+    if (savedCallsign) {
+        myCallsignInput.value = savedCallsign;
+    }
+    
+    // Load saved avatar if any
+    const savedAvatar = localStorage.getItem('tactical_avatar');
+    if (savedAvatar) {
+        currentAvatar = savedAvatar;
+        avatarOptions.forEach(opt => {
+            if(opt.getAttribute('data-avatar') === currentAvatar) {
+                opt.classList.add('active');
+            } else {
+                opt.classList.remove('active');
+            }
+        });
+    }
+    
     updateClock();
     setInterval(updateClock, 1000);
     renderChannelList();
@@ -192,7 +246,24 @@ function connectToChannel(chNum) {
             localNodeIndex = index;
             localPeerId = id;
             myPeerIdInput.value = `READY: CH ${chNum} (NODE ${index})`;
+            
+            activeUsers = {};
+            activeUsers[localNodeIndex] = {
+                callsign: myCallsignInput.value.trim() || 'Operator',
+                avatar: currentAvatar,
+                isSpeaking: false,
+                isMe: true,
+                lastSeen: Date.now()
+            };
+            if (activeChannelNum === chNum) updateActiveUsersUI();
+            
             setupPeerListeners(p);
+            
+            Object.values(presenceConnections).forEach(c => { if(c && c.close) c.close(); });
+            presenceConnections = {};
+            if (presenceInterval) clearInterval(presenceInterval);
+            presenceInterval = setInterval(() => broadcastHeartbeat(chNum), 3000);
+            broadcastHeartbeat(chNum);
         });
         
         p.on('error', (err) => {
@@ -220,18 +291,30 @@ function setupPeerListeners(p) {
         call.on('stream', (remoteStream) => {
             console.log('Receiving remote stream');
             
-            // Mobile browsers often block hidden <audio> tags from playing.
-            // Bypassing it by routing the WebRTC stream directly into the AudioContext
-            // since the AudioContext is already unlocked by the PTT presses/clicks.
+            // Ensure audio plays out loud by attaching to an HTML Audio Element First
+            let tempAudioEl = document.getElementById(`audio-${call.peer}`);
+            if (!tempAudioEl) {
+                tempAudioEl = document.createElement('audio');
+                tempAudioEl.id = `audio-${call.peer}`;
+                tempAudioEl.autoplay = true;
+                // Add it to the DOM so the browser respects it
+                document.body.appendChild(tempAudioEl);
+            }
+            tempAudioEl.srcObject = remoteStream;
+            tempAudioEl.play().catch(err => console.log('Audio auto-play blocked:', err));
+
+            // Then route through AudioContext strictly for visualization EQ
             initAudio();
             try {
+                // We use createMediaElementSource instead of MediaStreamSource to avoid muting
                 const source = audioCtx.createMediaStreamSource(remoteStream);
-                source.connect(audioCtx.destination);
+                currentAnalyser = audioCtx.createAnalyser();
+                currentAnalyser.fftSize = 64;
+                source.connect(currentAnalyser);
+                // Do NOT connect currentAnalyser.connect(audioCtx.destination) because 
+                // the HTMLAudioElement is already playing it, connecting it again would cause an echo!
             } catch (e) {
                 console.error("Error routing stream to AudioContext", e);
-                // Fallback to HTMLAudioElement
-                audioEl.srcObject = remoteStream;
-                audioEl.play().catch(err => console.log('Audio auto-play blocked:', err));
             }
             
             // Visual RX State
@@ -242,6 +325,14 @@ function setupPeerListeners(p) {
         
         call.on('close', () => {
             console.log('Call ended');
+            
+            // Cleanup the temporary audio element
+            const tempAudioEl = document.getElementById(`audio-${call.peer}`);
+            if (tempAudioEl) {
+                tempAudioEl.pause();
+                tempAudioEl.srcObject = null;
+                tempAudioEl.remove();
+            }
             screenRadio.classList.remove('rx-active');
             updateRadioState();
             stopEQ();
@@ -252,10 +343,29 @@ function setupPeerListeners(p) {
     // Listen for data connections (signaling for sound effects)
     p.on('connection', (conn) => {
         conn.on('data', (data) => {
-            if (data.type === 'ptt-press') {
+            let nodeIndex = -1;
+            const match = conn.peer.match(/node-(\d+)$/);
+            if (match) nodeIndex = parseInt(match[1]);
+
+            if (data.type === 'heartbeat') {
+                if (nodeIndex !== -1) {
+                    activeUsers[nodeIndex] = {
+                        callsign: data.callsign,
+                        avatar: data.avatar || '👤',
+                        isSpeaking: data.isSpeaking,
+                        isMe: false,
+                        lastSeen: Date.now()
+                    };
+                    updateActiveUsersUI();
+                }
+            } else if (data.type === 'ptt-press') {
                 playPTTPress();
-                callerIdDisplay.textContent = data.callerId;
+                callerIdDisplay.textContent = data.callerId || (activeUsers[nodeIndex] ? activeUsers[nodeIndex].callsign : 'Unknown');
                 topLeftStatus.classList.add('active');
+                if (nodeIndex !== -1 && activeUsers[nodeIndex]) {
+                    activeUsers[nodeIndex].isSpeaking = true;
+                    updateActiveUsersUI();
+                }
             } else if (data.type === 'ptt-release') {
                 playPTTRelease();
                 // Aggressively clean up UI state here as well, 
@@ -264,8 +374,77 @@ function setupPeerListeners(p) {
                 updateRadioState();
                 stopEQ();
                 topLeftStatus.classList.remove('active');
+                if (nodeIndex !== -1 && activeUsers[nodeIndex]) {
+                    activeUsers[nodeIndex].isSpeaking = false;
+                    updateActiveUsersUI();
+                }
             }
         });
+    });
+}
+
+function broadcastHeartbeat(chNum) {
+    if (!peer || peer.disconnected) return;
+    
+    const myCallsign = myCallsignInput.value.trim() || 'Operator';
+    activeUsers[localNodeIndex] = {
+        callsign: myCallsign,
+        avatar: currentAvatar,
+        isSpeaking: isTransmitting,
+        isMe: true,
+        lastSeen: Date.now()
+    };
+    
+    const now = Date.now();
+    let changed = false;
+    for (const [nodeId, user] of Object.entries(activeUsers)) {
+        if (!user.isMe && now - user.lastSeen > 10000) {
+            delete activeUsers[nodeId];
+            changed = true;
+        }
+    }
+    if (changed) updateActiveUsersUI();
+    
+    for (let i = 1; i <= MAX_NODES; i++) {
+        if (i !== localNodeIndex) {
+            let conn = presenceConnections[i];
+            if (!conn || !conn.open) {
+                const targetId = `tactical-comms-ch-${chNum}-node-${i}`;
+                conn = peer.connect(targetId);
+                presenceConnections[i] = conn;
+                conn.on('open', () => {
+                    conn.send({ type: 'heartbeat', callsign: myCallsign, avatar: currentAvatar, isSpeaking: isTransmitting });
+                });
+            } else {
+                conn.send({ type: 'heartbeat', callsign: myCallsign, avatar: currentAvatar, isSpeaking: isTransmitting });
+            }
+        }
+    }
+}
+
+function updateActiveUsersUI() {
+    if (!countText || !activeUsersList) return;
+    
+    const users = Object.values(activeUsers).filter(u => u && (u.isMe || (Date.now() - u.lastSeen <= 10000)));
+    countText.textContent = `${users.length} Online`;
+    
+    activeUsersList.innerHTML = '';
+    users.forEach(u => {
+        const item = document.createElement('div');
+        item.className = `user-list-item ${u.isMe ? 'is-me' : ''} ${u.isSpeaking ? 'is-speaking' : ''}`;
+        
+        let badges = '';
+        if (u.isSpeaking) badges += `<span class="badge speaking">TX</span>`;
+        if (u.isMe) badges += `<span class="badge me">YOU</span>`;
+        
+        item.innerHTML = `
+            <div class="user-info-row" style="display: flex; align-items: center; gap: 10px;">
+                <div class="user-avatar" style="font-size: 20px;">${u.avatar || '👤'}</div>
+                <div class="user-name">${u.callsign}</div>
+            </div>
+            <div class="user-badges">${badges}</div>
+        `;
+        activeUsersList.appendChild(item);
     });
 }
 
@@ -274,6 +453,9 @@ async function requestMic() {
         try {
             localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             console.log('Microphone access granted');
+            
+            initAudio();
+            localAudioSource = audioCtx.createMediaStreamSource(localStream);
         } catch (err) {
             console.error('Microphone access denied or error:', err);
             alert("Microphone access is required to transmit audio.");
@@ -290,17 +472,55 @@ function updateClock() {
 
 // Visual Helpers
 function startEQ() {
-    if(eqInterval) clearInterval(eqInterval);
-    eqInterval = setInterval(() => {
-        eqBars.forEach(bar => {
-            const height = 4 + Math.random() * 24; // 4 to 28px
-            bar.style.height = `${height}px`;
-        });
-    }, 100);
+    if(eqAnimFrame) cancelAnimationFrame(eqAnimFrame);
+    
+    const dataArray = currentAnalyser ? new Uint8Array(currentAnalyser.frequencyBinCount) : null;
+    let lastAnimTime = 0;
+    
+    function renderFrame(time) {
+        if (!isTransmitting && !screenRadio.classList.contains('rx-active')) return;
+        eqAnimFrame = requestAnimationFrame(renderFrame);
+        
+        // Throttling for a slightly retro LCD feel
+        if (time - lastAnimTime < 60) return;
+        lastAnimTime = time;
+        
+        // Compute Volume
+        let vol = 0;
+        if (currentAnalyser && dataArray) {
+            currentAnalyser.getByteFrequencyData(dataArray);
+            let sum = 0;
+            // Only average the lower frequencies where the human voice usually is (e.g. first 20 bins)
+            let voiceBins = Math.min(20, dataArray.length);
+            for(let i = 0; i < voiceBins; i++) {
+                sum += dataArray[i];
+            }
+            vol = sum / voiceBins; 
+        }
+        
+        // Scale and Static threshold
+        if (vol < 15) { // raised threshold slightly to ignore static/background noise
+            eqBars.forEach(bar => bar.style.height = `4px`);
+        } else {
+            // Apply easing/damping: vol is max 255, we want max height around 28px.
+            // A non-linear scale helps voice range stand out without clipping to maximum.
+            const normalizedVol = Math.sqrt(vol / 255); // 0.0 to 1.0 curve
+            
+            eqBars.forEach((bar, index) => {
+                // Add minor variation between bars instead of completely random height
+                const barVariation = 1 + (Math.sin(time/200 + index) * 0.3); // +/- 30% variation
+                const height = 4 + (normalizedVol * 24 * barVariation); 
+                
+                bar.style.height = `${Math.min(height, 28)}px`; // clamp max 28px
+            });
+        }
+    }
+    eqAnimFrame = requestAnimationFrame(renderFrame);
 }
 
 function stopEQ() {
-    clearInterval(eqInterval);
+    if(eqAnimFrame) cancelAnimationFrame(eqAnimFrame);
+    currentAnalyser = null;
     eqBars.forEach(bar => {
         bar.style.height = `4px`; // reset
     });
@@ -345,14 +565,32 @@ function renderChannelList() {
         `;
         
         card.addEventListener('click', () => {
-            activeChannelNum = ch.num;
-            renderChannelList();
-            updateRadioScreen();
-            switchScreen('screen-radio');
+            selectedChannelForAction = ch;
+            if (actionModalCh) actionModalCh.textContent = ch.num;
+            if (actionModalName) actionModalName.textContent = ch.name;
+            if (modalChannelActionOverlay) modalChannelActionOverlay.classList.add('show');
         });
         
         chListContainer.appendChild(card);
     });
+}
+
+function attemptChannelSwitch(targetChNum) {
+    if (targetChNum === '10') {
+        pendingChannelSelect = targetChNum;
+        if (inputPin) inputPin.value = '';
+        if (modalPinOverlay) modalPinOverlay.classList.add('show');
+    } else {
+        executeChannelSwitch(targetChNum);
+    }
+}
+
+function executeChannelSwitch(targetChNum) {
+    activeChannelNum = targetChNum;
+    renderChannelList();
+    updateRadioScreen();
+    switchScreen('screen-radio');
+    connectToChannel(activeChannelNum);
 }
 
 // Update Main Radio Screen
@@ -379,8 +617,20 @@ async function startTx(e) {
     await requestMic();
     if(!localStream) return; // Cannot transmit without mic
     
+    if (localAudioSource) {
+        currentAnalyser = audioCtx.createAnalyser();
+        currentAnalyser.fftSize = 64;
+        try { localAudioSource.disconnect(); } catch(e) {}
+        localAudioSource.connect(currentAnalyser);
+    }
+    
     isSignaling = true;
     isTransmitting = true;
+    
+    if (activeUsers[localNodeIndex]) {
+        activeUsers[localNodeIndex].isSpeaking = true;
+        updateActiveUsersUI();
+    }
     
     screenRadio.classList.remove('rx-active');
     screenRadio.classList.add('tx-active');
@@ -431,6 +681,12 @@ function stopTx(e) {
     
     isSignaling = true;
     isTransmitting = false;
+    
+    if (activeUsers[localNodeIndex]) {
+        activeUsers[localNodeIndex].isSpeaking = false;
+        updateActiveUsersUI();
+    }
+    
     screenRadio.classList.remove('tx-active');
     pttBtn.classList.remove('pressed');
     
@@ -502,6 +758,7 @@ function saveChannel() {
     updateRadioScreen();
     closeModal();
     switchScreen('screen-radio');
+    connectToChannel(activeChannelNum);
 }
 
 // Setup listeners
@@ -525,6 +782,211 @@ function setupEventListeners() {
     btnAddChannel.addEventListener('click', openModal);
     btnCancelModal.addEventListener('click', closeModal);
     btnSaveChannel.addEventListener('click', saveChannel);
+    
+    // Save Callsign Event
+    if(btnSaveCallsign) {
+        btnSaveCallsign.addEventListener('click', () => {
+            const newName = myCallsignInput.value.trim() || 'Operator';
+            localStorage.setItem('tactical_callsign', newName);
+            myCallsignInput.value = newName; // clean up spaces
+            
+            if (activeUsers[localNodeIndex]) {
+                activeUsers[localNodeIndex].callsign = newName;
+                updateActiveUsersUI();
+            }
+            
+            const originalText = btnSaveCallsign.textContent;
+            btnSaveCallsign.textContent = 'SAVED!';
+            btnSaveCallsign.style.background = 'var(--neon-green)';
+            btnSaveCallsign.style.color = '#000';
+            
+            // Save Avatar as well on Save button click
+            localStorage.setItem('tactical_avatar', currentAvatar);
+            
+            setTimeout(() => {
+                btnSaveCallsign.textContent = originalText;
+                btnSaveCallsign.style.background = '';
+                btnSaveCallsign.style.color = '';
+            }, 1500);
+        });
+    }
+
+    if (btnActiveUsers) {
+        btnActiveUsers.addEventListener('click', () => {
+            if (usersModalCh) usersModalCh.textContent = activeChannelNum;
+            if (modalUsersOverlay) modalUsersOverlay.classList.add('show');
+            updateActiveUsersUI();
+        });
+    }
+    
+    // Avatar Selection Event
+    avatarOptions.forEach(opt => {
+        opt.addEventListener('click', () => {
+            avatarOptions.forEach(o => o.classList.remove('active'));
+            opt.classList.add('active');
+            currentAvatar = opt.getAttribute('data-avatar');
+            
+            // Instantly update my own presence locally
+            if (activeUsers[localNodeIndex]) {
+                activeUsers[localNodeIndex].avatar = currentAvatar;
+                updateActiveUsersUI();
+            }
+        });
+    });
+
+    if (btnCloseUsersModal) {
+        btnCloseUsersModal.addEventListener('click', () => {
+            if (modalUsersOverlay) modalUsersOverlay.classList.remove('show');
+        });
+    }
+
+    if (btnChUp) {
+        btnChUp.addEventListener('click', () => {
+            if (isTransmitting || isSignaling) return;
+            let currentIndex = channels.findIndex(c => c.num === activeChannelNum);
+            let nextCh = (currentIndex < channels.length - 1) ? channels[currentIndex + 1].num : channels[0].num;
+            attemptChannelSwitch(nextCh);
+        });
+    }
+
+    if (btnChDown) {
+        btnChDown.addEventListener('click', () => {
+            if (isTransmitting || isSignaling) return;
+            let currentIndex = channels.findIndex(c => c.num === activeChannelNum);
+            let prevCh = (currentIndex > 0) ? channels[currentIndex - 1].num : channels[channels.length - 1].num;
+            attemptChannelSwitch(prevCh);
+        });
+    }
+
+    if (btnCancelPin) {
+        btnCancelPin.addEventListener('click', () => {
+            if (modalPinOverlay) modalPinOverlay.classList.remove('show');
+            
+            if (pendingChannelSelect) {
+                // Find next channel and switch to it
+                let currentIndex = channels.findIndex(c => c.num === pendingChannelSelect);
+                let nextCh = (currentIndex < channels.length - 1) ? channels[currentIndex + 1].num : channels[0].num;
+                pendingChannelSelect = null;
+                attemptChannelSwitch(nextCh);
+            }
+        });
+    }
+
+    if (btnSubmitPin) {
+        btnSubmitPin.addEventListener('click', () => {
+            const enteredPin = inputPin.value.trim();
+            if (enteredPin === '1122') {
+                if (modalPinOverlay) modalPinOverlay.classList.remove('show');
+                if (pendingChannelSelect) {
+                    executeChannelSwitch(pendingChannelSelect);
+                    pendingChannelSelect = null;
+                }
+            } else {
+                alert("ACCESS DENIED: Incorrect PIN for Channel 10.");
+                inputPin.value = '';
+            }
+        });
+    }
+
+    if (btnCancelAction) {
+        btnCancelAction.addEventListener('click', () => {
+            if (modalChannelActionOverlay) modalChannelActionOverlay.classList.remove('show');
+            selectedChannelForAction = null;
+        });
+    }
+
+    if (btnActionJoin) {
+        btnActionJoin.addEventListener('click', () => {
+            if (modalChannelActionOverlay) modalChannelActionOverlay.classList.remove('show');
+            if (selectedChannelForAction) {
+                attemptChannelSwitch(selectedChannelForAction.num);
+            }
+        });
+    }
+
+    if (btnActionInfo) {
+        btnActionInfo.addEventListener('click', () => {
+            if (modalChannelActionOverlay) modalChannelActionOverlay.classList.remove('show');
+            if (selectedChannelForAction) {
+                // If checking info for current active channel
+                if (selectedChannelForAction.num === activeChannelNum) {
+                    if (usersModalCh) usersModalCh.textContent = activeChannelNum;
+                    if (modalUsersOverlay) modalUsersOverlay.classList.add('show');
+                    updateActiveUsersUI();
+                } else {
+                    // Check another channel's users by quickly probing without fully switching
+                    showForeignChannelUsers(selectedChannelForAction.num);
+                }
+            }
+        });
+    }
+}
+
+function showForeignChannelUsers(targetChNum) {
+    if (usersModalCh) usersModalCh.textContent = targetChNum;
+    if (activeUsersList) {
+        activeUsersList.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-muted);">SCANNING FREQUENCY...</div>';
+    }
+    if (modalUsersOverlay) modalUsersOverlay.classList.add('show');
+    
+    // Create a temporary peer to listen for heartbeats briefly
+    const tempId = `tactical-comms-scanner-${Math.floor(Math.random()*1000)}`;
+    const scanner = new Peer(tempId);
+    const foreignUsers = {};
+    
+    scanner.on('open', () => {
+        // Connect to all possible nodes on that channel
+        for(let i=1; i<=MAX_NODES; i++) {
+            const nodeToScan = `tactical-comms-ch-${targetChNum}-node-${i}`;
+            const conn = scanner.connect(nodeToScan);
+            
+            // If they are there, they will answer our connection and send heartbeats
+            conn.on('data', (data) => {
+                if (data.type === 'heartbeat') {
+                    foreignUsers[i] = {
+                        callsign: data.callsign,
+                        avatar: data.avatar || '👤',
+                        isSpeaking: data.isSpeaking,
+                        isMe: false
+                    };
+                    renderForeignUsers(foreignUsers);
+                }
+            });
+            setTimeout(() => { if(conn) conn.close(); }, 5000); // Close connection after 5s
+        }
+        
+        // Timeout the scan UI after 2.5 seconds
+        setTimeout(() => {
+            if (Object.keys(foreignUsers).length === 0 && activeUsersList && usersModalCh && usersModalCh.textContent === targetChNum) {
+                 activeUsersList.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-muted);">NO ACTIVE OPERATORS FOUND</div>';
+            }
+            scanner.destroy();
+        }, 2500);
+    });
+}
+
+function renderForeignUsers(fUsers) {
+    if (!activeUsersList) return;
+    activeUsersList.innerHTML = '';
+    const usersArr = Object.values(fUsers);
+    
+    if (usersArr.length === 0) {
+        activeUsersList.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-muted);">NO ACTIVE OPERATORS FOUND</div>';
+        return;
+    }
+    
+    usersArr.forEach(u => {
+        const item = document.createElement('div');
+        item.className = `user-list-item`;
+        item.innerHTML = `
+            <div class="user-info-row" style="display: flex; align-items: center; gap: 10px;">
+                <div class="user-avatar" style="font-size: 20px;">${u.avatar || '👤'}</div>
+                <div class="user-name">${u.callsign}</div>
+            </div>
+            <div class="user-badges">${u.isSpeaking ? '<span class="badge speaking">TX</span>' : ''}</div>
+        `;
+        activeUsersList.appendChild(item);
+    });
 }
 
 // Run
